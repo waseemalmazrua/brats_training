@@ -40,6 +40,8 @@ from monai.transforms import (
     AsDiscrete,
     MapTransform,
 )
+from monai.transforms import DivisiblePadd
+
 from monai.inferers import sliding_window_inference
 
 # =====================================================
@@ -227,6 +229,7 @@ train_transforms = Compose([
     Orientationd(keys=["image", "label"], axcodes="RAS"),
     Spacingd(keys=["image", "label"], pixdim=(1, 1, 1),
              mode=("bilinear", "nearest")),
+    DivisiblePadd(keys=["image", "label"], k=16),
     NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
     RandCropByPosNegLabeld(
         keys=["image", "label"],
@@ -243,6 +246,7 @@ val_transforms = Compose([
     Orientationd(keys=["image", "label"], axcodes="RAS"),
     Spacingd(keys=["image", "label"], pixdim=(1, 1, 1),
              mode=("bilinear", "nearest")),
+    DivisiblePadd(keys=["image", "label"], k=16),
     NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
 ])
 
@@ -252,6 +256,7 @@ infer_transforms = Compose([
     EnsureChannelFirstd(keys=["image"]),
     Orientationd(keys=["image"], axcodes="RAS"),
     Spacingd(keys=["image"], pixdim=(1, 1, 1), mode="bilinear"),
+    DivisiblePadd(keys=["image", "label"], k=16),
     NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
 ])
 
