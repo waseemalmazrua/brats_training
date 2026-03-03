@@ -231,7 +231,7 @@ train_transforms = Compose([
     RandCropByPosNegLabeld(
         keys=["image", "label"],
         label_key="label",
-        spatial_size=(96, 96, 96),
+        spatial_size=(128, 128, 128),
         pos=1, neg=1, num_samples=4,
     ),
 ])
@@ -562,7 +562,7 @@ def run_inference(
     with torch.no_grad():
         logits = sliding_window_inference(
             inputs        = image,
-            roi_size      = (96, 96, 96),
+            roi_size      = (128, 128, 128),
             sw_batch_size = 1,
             predictor     = model,
             overlap       = 0.5,
