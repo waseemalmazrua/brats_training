@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 # =====================================================
 
 DATA_DIR        = Path(os.environ.get("DATA_ROOT",
-                        "/workspace/data/BraTS20"))
+                        "/workspace/data/BraTS20/BraTS2020_TrainingData"))
 CHECKPOINT_DIR  = Path(os.environ.get("CHECKPOINT_DIR", "./checkpoints"))
 
 MAX_EPOCHS      = int(os.environ.get("MAX_EPOCHS",    "100"))
