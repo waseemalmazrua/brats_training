@@ -7,12 +7,11 @@ RUN apt-get update && apt-get install -y \
     gcc \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml ./
 
-RUN pip install uv
-RUN uv sync --frozen
-
-ENV PATH="/app/.venv/bin:$PATH"
+RUN pip install --upgrade pip
+RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+RUN pip install monai nibabel scikit-learn tqdm mlflow
 
 COPY . .
 
