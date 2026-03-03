@@ -93,7 +93,7 @@ if MLFLOW_URI:
         from mlflow.tracking import MlflowClient as _MlflowClient
 
         _mlflow.set_tracking_uri(MLFLOW_URI)
-        _mlflow.set_experiment("BraTS_UNet_Production")
+        _mlflow.set_experiment("BraTS_UNet_Production_v2")
 
         mlflow        = _mlflow
         mlflow_pyfunc = _mlflow_pyfunc
