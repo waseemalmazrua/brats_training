@@ -1,9 +1,7 @@
 # =====================================================
 # MONAI 3D UNet — BraTS Segmentation
-# Target  : Ubuntu GPU VM (DigitalOcean / any cloud VM)
+# Target  : Ubuntu GPU VM
 # Covers  : Training + MLflow PyFunc + Production Inference
-#           Physician uploads 4 NIfTI files → gets back
-#           segmentation mask + tumor report (size, grade)
 # =====================================================
 
 # =====================================================
@@ -28,7 +26,7 @@ from pathlib import Path
 from monai.networks.nets import UNet
 from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric
-from monai.data import Dataset, DataLoader
+from monai.data import Dataset, DataLoader, decollate_batch
 from monai.transforms import (
     Compose,
     LoadImaged,
@@ -63,12 +61,12 @@ DATA_DIR         = Path(os.environ.get("DATA_ROOT",
                          "/workspace/data/BraTS20"))
 CHECKPOINT_DIR   = Path(os.environ.get("CHECKPOINT_DIR", "./checkpoints"))
 
-MAX_EPOCHS       = int(os.environ.get("MAX_EPOCHS",    "100"))
-BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",    "2"))
+MAX_EPOCHS       = int(os.environ.get("MAX_EPOCHS",     "100"))
+BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",     "2"))
 LEARNING_RATE    = float(os.environ.get("LEARNING_RATE","1e-4"))
-PATIENCE         = int(os.environ.get("PATIENCE",      "15"))
-MIN_DELTA        = float(os.environ.get("MIN_DELTA",   "0.001"))
-VAL_INTERVAL     = int(os.environ.get("VAL_INTERVAL",  "1"))
+PATIENCE         = int(os.environ.get("PATIENCE",       "15"))
+MIN_DELTA        = float(os.environ.get("MIN_DELTA",    "0.001"))
+VAL_INTERVAL     = int(os.environ.get("VAL_INTERVAL",   "1"))
 
 _cpu_cap         = max(1, (os.cpu_count() or 2) - 1)
 NUM_WORKERS      = int(os.environ.get("NUM_WORKERS", str(min(4, _cpu_cap))))
@@ -77,7 +75,7 @@ REQUIRE_GPU      = os.environ.get("REQUIRE_GPU", "true").lower() != "false"
 MLFLOW_URI       = os.environ.get("MLFLOW_TRACKING_URI", "").strip()
 MODEL_NAME       = os.environ.get("MODEL_NAME", "brats_unet_v1")
 
-# Voxel spacing after Spacingd resampling — used for volume calculation
+# Voxel volume for tumor size calculation (mm³)
 VOXEL_SPACING_MM = (1.0, 1.0, 1.0)
 
 # =====================================================
@@ -95,7 +93,7 @@ if MLFLOW_URI:
         from mlflow.tracking import MlflowClient as _MlflowClient
 
         _mlflow.set_tracking_uri(MLFLOW_URI)
-        _mlflow.set_experiment("BraTS_UNet_Production_v2")
+        _mlflow.set_experiment("BraTS_UNet_Production")
 
         mlflow        = _mlflow
         mlflow_pyfunc = _mlflow_pyfunc
@@ -107,25 +105,18 @@ else:
     logger.info("MLFLOW_TRACKING_URI not set — MLflow tracking disabled.")
 
 # =====================================================
-# 6️⃣  MLflow Safe Logging Helpers
-#      Filters NaN/Inf — prevents PostgreSQL duplicate
-#      key BAD_REQUEST crash
+# 6️⃣  MLflow Safe Logging
+#      Filters NaN/Inf — prevents PostgreSQL crash
 # =====================================================
 
 def safe_log_metric(key: str, value: float, step: int):
-    """
-    Log only if value is a real finite number.
-    NaN and Inf are silently skipped — they cause
-    PostgreSQL unique constraint violations in MLflow.
-    """
+    """Skip NaN/Inf — prevents PostgreSQL duplicate key error."""
     if mlflow is None:
         return
     if value is None:
         return
     if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
-        logger.warning(
-            f"Skipping MLflow metric '{key}' step={step} — value={value}"
-        )
+        logger.warning(f"Skipping MLflow metric '{key}' step={step} — value={value}")
         return
     mlflow.log_metric(key, value, step=step)
 
@@ -153,20 +144,20 @@ def validate_gpu() -> torch.device:
         if REQUIRE_GPU:
             raise RuntimeError(
                 "REQUIRE_GPU=true but no CUDA GPU found.\n"
-                "  • Run: nvidia-smi\n"
-                "  • Set REQUIRE_GPU=false to allow CPU-only training."
+                "  • Run  : nvidia-smi\n"
+                "  • Fix  : Set REQUIRE_GPU=false to allow CPU-only."
             )
     return torch.device("cuda" if has_gpu else "cpu")
 
 # =====================================================
-# 8️⃣  Safe Glob Helper
+# 8️⃣  Safe Glob
 # =====================================================
 
 def safe_glob_one(pattern: str, description: str) -> str:
     """
-    Glob and return first match.
-    Handles both .nii and .nii.gz automatically.
-    Raises FileNotFoundError clearly instead of IndexError.
+    Return first glob match.
+    Tries .nii.gz first, falls back to .nii automatically.
+    Raises FileNotFoundError clearly — never IndexError.
     """
     for pat in [pattern, pattern.replace(".nii.gz", ".nii")]:
         matches = sorted(glob.glob(pat))
@@ -174,9 +165,9 @@ def safe_glob_one(pattern: str, description: str) -> str:
             return matches[0]
     raise FileNotFoundError(
         f"Missing file — {description}\n"
-        f"  Pattern tried : {pattern}\n"
-        f"  Also tried    : {pattern.replace('.nii.gz', '.nii')}\n"
-        f"  Tip           : Check DATA_ROOT and BraTS folder layout."
+        f"  Tried : {pattern}\n"
+        f"  Tried : {pattern.replace('.nii.gz', '.nii')}\n"
+        f"  Tip   : Check DATA_ROOT and BraTS folder layout."
     )
 
 # =====================================================
@@ -184,6 +175,10 @@ def safe_glob_one(pattern: str, description: str) -> str:
 # =====================================================
 
 def validate_dataset(data_dir: Path) -> list:
+    """
+    Scan BraTS folder, build [{image:[4 paths], label:path}] list.
+    Skips incomplete cases with a warning instead of crashing.
+    """
     if not data_dir.exists():
         raise FileNotFoundError(
             f"Dataset root not found: {data_dir}\n"
@@ -198,9 +193,7 @@ def validate_dataset(data_dir: Path) -> list:
 
     cases = sorted([d for d in data_dir.iterdir() if d.is_dir()])
     if not cases:
-        raise FileNotFoundError(
-            f"No case sub-directories found in: {data_dir}"
-        )
+        raise FileNotFoundError(f"No case sub-directories found in: {data_dir}")
 
     data, skipped = [], []
 
@@ -209,7 +202,7 @@ def validate_dataset(data_dir: Path) -> list:
         try:
             entry = {
                 "image": [
-                    # ORDER IS FIXED — must match inference order always
+                    # ⚠️ ORDER IS FIXED — must match inference order
                     safe_glob_one(os.path.join(cp, "*_t1.nii.gz"),    f"{case_path.name} T1"),
                     safe_glob_one(os.path.join(cp, "*_t1ce.nii.gz"),  f"{case_path.name} T1ce"),
                     safe_glob_one(os.path.join(cp, "*_t2.nii.gz"),    f"{case_path.name} T2"),
@@ -225,22 +218,20 @@ def validate_dataset(data_dir: Path) -> list:
             skipped.append(case_path.name)
 
     if not data:
-        raise RuntimeError(
-            f"All {len(cases)} cases skipped — check dataset structure."
-        )
+        raise RuntimeError(f"All {len(cases)} cases skipped — check dataset structure.")
 
     logger.info(f"✓ Dataset OK — {len(data)} valid cases ({len(skipped)} skipped).")
     return data
 
 # =====================================================
-# 🔟  BraTS Label Remap  (4 → 3 for training)
+# 🔟  BraTS Label Remap  (4 → 3)
 # =====================================================
 
 class RemapBraTSLabels(MapTransform):
     """
-    BraTS labels: 0=background, 1=NCR, 2=ED, 4=ET
-    Remap 4→3 so labels are contiguous: 0,1,2,3
-    Reversed (3→4) after inference.
+    BraTS labels : 0=BG  1=NCR  2=ED  4=ET
+    Remapped to  : 0=BG  1=NCR  2=ED  3=ET  (contiguous)
+    Restored after inference : 3 → 4
     """
     def __call__(self, data):
         d = dict(data)
@@ -258,15 +249,20 @@ train_transforms = Compose([
     RemapBraTSLabels(keys=["label"]),
     EnsureChannelFirstd(keys=["image", "label"]),
     Orientationd(keys=["image", "label"], axcodes="RAS"),
-    Spacingd(keys=["image", "label"], pixdim=(1, 1, 1),
-             mode=("bilinear", "nearest")),
-    DivisiblePadd(keys=["image", "label"], k=16),   # ensures dims % 2^4 == 0
+    Spacingd(
+        keys=["image", "label"],
+        pixdim=(1, 1, 1),
+        mode=("bilinear", "nearest"),
+    ),
+    DivisiblePadd(keys=["image", "label"], k=16),   # prevents UNet size mismatch
     NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
     RandCropByPosNegLabeld(
         keys=["image", "label"],
         label_key="label",
-        spatial_size=(128, 128, 128),               # multiple of 16 ✅
-        pos=1, neg=1, num_samples=4,
+        spatial_size=(128, 128, 128),               # must be multiple of 16
+        pos=1,
+        neg=1,
+        num_samples=4,
     ),
 ])
 
@@ -275,24 +271,48 @@ val_transforms = Compose([
     RemapBraTSLabels(keys=["label"]),
     EnsureChannelFirstd(keys=["image", "label"]),
     Orientationd(keys=["image", "label"], axcodes="RAS"),
-    Spacingd(keys=["image", "label"], pixdim=(1, 1, 1),
-             mode=("bilinear", "nearest")),
+    Spacingd(
+        keys=["image", "label"],
+        pixdim=(1, 1, 1),
+        mode=("bilinear", "nearest"),
+    ),
     DivisiblePadd(keys=["image", "label"], k=16),
     NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
 ])
 
-# Inference-only — no label key
+# Inference only — no label, no augmentation
 infer_transforms = Compose([
     LoadImaged(keys=["image"]),
     EnsureChannelFirstd(keys=["image"]),
     Orientationd(keys=["image"], axcodes="RAS"),
     Spacingd(keys=["image"], pixdim=(1, 1, 1), mode="bilinear"),
-    DivisiblePadd(keys=["image"], k=16),            # image only — no "label" key
+    DivisiblePadd(keys=["image"], k=16),            # image only — no label key
     NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
 ])
 
 # =====================================================
-# 1️⃣2️⃣  Tumor Report Generator
+# 1️⃣2️⃣  Post-processing
+#
+#  WHY decollate_batch + per-sample transforms?
+#  ─────────────────────────────────────────────
+#  DiceMetric expects a list of individual tensors,
+#  not a batched tensor. Without decollate_batch the
+#  metric treats the whole batch as one volume →
+#  artificially high Dice (0.99) and NaN per class.
+#
+#  post_pred  : softmax → argmax → one-hot  (discrete)
+#  post_label : one-hot only  (already integer labels)
+# =====================================================
+
+post_pred = Compose([
+    Activations(softmax=True),
+    AsDiscrete(argmax=True, to_onehot=4),   # (4, H, W, D) one-hot
+])
+
+post_label = AsDiscrete(to_onehot=4)        # (4, H, W, D) one-hot
+
+# =====================================================
+# 1️⃣3️⃣  Tumor Report  (inference only — not used in training)
 # =====================================================
 
 TUMOR_LABELS = {
@@ -315,23 +335,26 @@ def classify_tumor_grade(has_et: bool, has_ncr: bool, has_ed: bool) -> str:
 
 def generate_tumor_report(seg: np.ndarray,
                            voxel_spacing_mm: tuple = (1.0, 1.0, 1.0)) -> dict:
-    voxel_vol_mm3  = (voxel_spacing_mm[0]
-                      * voxel_spacing_mm[1]
-                      * voxel_spacing_mm[2])
+    """
+    Compute per-region volumes (mm³ / cm³) and WHO grade heuristic.
+    Input  : seg — (H, W, D) uint8 with BraTS labels 0, 1, 2, 4
+    Output : dict with volumes + grade string
+    """
+    voxel_vol_mm3  = voxel_spacing_mm[0] * voxel_spacing_mm[1] * voxel_spacing_mm[2]
     report         = {}
     region_volumes = {}
 
     for label_id, label_name in TUMOR_LABELS.items():
         voxel_count              = int(np.sum(seg == label_id))
         vol_mm3                  = voxel_count * voxel_vol_mm3
-        vol_cm3                  = vol_mm3 / 1000.0
         region_volumes[label_id] = vol_mm3
         report[label_name]       = {
             "voxel_count": voxel_count,
             "volume_mm3":  round(vol_mm3, 2),
-            "volume_cm3":  round(vol_cm3, 4),
+            "volume_cm3":  round(vol_mm3 / 1000.0, 4),
         }
 
+    # Whole Tumor = NCR + ED + ET
     wt_voxels  = int(np.sum(seg > 0))
     wt_vol_mm3 = wt_voxels * voxel_vol_mm3
     report["Whole Tumor"] = {
@@ -340,6 +363,7 @@ def generate_tumor_report(seg: np.ndarray,
         "volume_cm3":  round(wt_vol_mm3 / 1000.0, 4),
     }
 
+    # Tumor Core = NCR + ET
     tc_voxels  = int(np.sum((seg == 1) | (seg == 4)))
     tc_vol_mm3 = tc_voxels * voxel_vol_mm3
     report["Tumor Core"] = {
@@ -375,23 +399,29 @@ def print_tumor_report(report: dict):
     logger.info("=" * 55)
 
 # =====================================================
-# 1️⃣3️⃣  PyFunc Production Model (logged to MLflow)
+# 1️⃣4️⃣  MLflow PyFunc Wrapper  (production inference)
 # =====================================================
 
 if mlflow_pyfunc is not None:
 
     class BraTS_UNet_v1_PyFunc(mlflow_pyfunc.PythonModel):
         """
-        MLflow PyFunc wrapper for production inference.
+        MLflow PyFunc — production inference wrapper.
 
         Input:
-            {"image": [t1_path, t1ce_path, t2_path, flair_path]}
-            ORDER IS FIXED: t1 → t1ce → t2 → flair
-            Accepts .nii and .nii.gz
+            {
+              "image": [
+                  "/path/case_t1.nii(.gz)",     # channel 0 — T1
+                  "/path/case_t1ce.nii(.gz)",   # channel 1 — T1ce
+                  "/path/case_t2.nii(.gz)",     # channel 2 — T2
+                  "/path/case_flair.nii(.gz)",  # channel 3 — FLAIR
+              ]
+            }
+            ⚠️ ORDER IS FIXED: t1 → t1ce → t2 → flair
 
         Output:
             {
-              "segmentation": np.ndarray (H, W, D) uint8 — BraTS labels 0,1,2,4
+              "segmentation": np.ndarray (H,W,D) uint8 — labels 0,1,2,4
               "report":       dict — volumes + WHO grade heuristic
             }
         """
@@ -428,7 +458,7 @@ if mlflow_pyfunc is not None:
             ])
 
         def predict(self, context, model_input: dict) -> dict:
-            # ── 1. Validate ────────────────────────
+            # ── Validate ───────────────────────────
             if "image" not in model_input:
                 raise ValueError(
                     "model_input must contain key 'image' "
@@ -448,12 +478,12 @@ if mlflow_pyfunc is not None:
                         f"NIfTI not found for {mod} (channel {i}): {p}"
                     )
 
-            # ── 2. Preprocess ──────────────────────
+            # ── Preprocess ─────────────────────────
             logger.info("Running inference...")
             data  = self.preprocess({"image": paths})
             image = data["image"].unsqueeze(0).to(self.device)
 
-            # ── 3. Sliding window ──────────────────
+            # ── Sliding window inference ───────────
             with torch.no_grad():
                 logits = sliding_window_inference(
                     inputs        = image,
@@ -463,20 +493,20 @@ if mlflow_pyfunc is not None:
                     overlap       = 0.5,
                 )
 
-            # ── 4. Postprocess ─────────────────────
+            # ── Postprocess ────────────────────────
             probs  = torch.softmax(logits, dim=1)
             seg    = torch.argmax(probs, dim=1)[0]
             seg_np = seg.cpu().numpy().astype("uint8")
             seg_np[seg_np == 3] = 4             # restore BraTS label 4
 
-            # ── 5. Report ──────────────────────────
+            # ── Tumor report ───────────────────────
             report = generate_tumor_report(seg_np, VOXEL_SPACING_MM)
             print_tumor_report(report)
 
             return {"segmentation": seg_np, "report": report}
 
 # =====================================================
-# 1️⃣4️⃣  Standalone Inference (no MLflow needed)
+# 1️⃣5️⃣  Standalone Inference  (no MLflow needed)
 # =====================================================
 
 def run_inference(
@@ -488,8 +518,8 @@ def run_inference(
     output_path: str = "./prediction_seg.nii.gz",
 ) -> dict:
     """
-    Standalone inference — loads best_model.pth directly.
-    Saves segmentation as NIfTI and returns tumor report.
+    Load checkpoint → preprocess → sliding window → save NIfTI → return report.
+    Does not require MLflow.
     """
     try:
         import nibabel as nib
@@ -498,14 +528,15 @@ def run_inference(
 
     device = validate_gpu()
 
+    # Validate all input files
     for mod, p in {"t1": t1_path, "t1ce": t1ce_path,
                    "t2": t2_path, "flair": flair_path}.items():
         if not os.path.exists(p):
             raise FileNotFoundError(f"Missing {mod} file: {p}")
-
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Checkpoint not found: {model_path}")
 
+    # Load model
     model = UNet(
         spatial_dims=3, in_channels=4, out_channels=4,
         channels=(16, 32, 64, 128, 256),
@@ -515,10 +546,12 @@ def run_inference(
     model.eval()
     logger.info(f"✓ Model loaded from {model_path}")
 
+    # Preprocess
     image_paths = [t1_path, t1ce_path, t2_path, flair_path]
     data        = infer_transforms({"image": image_paths})
     image       = data["image"].unsqueeze(0).to(device)
 
+    # Inference
     logger.info("Running sliding window inference...")
     with torch.no_grad():
         logits = sliding_window_inference(
@@ -526,11 +559,14 @@ def run_inference(
             sw_batch_size=1, predictor=model, overlap=0.5,
         )
 
+    # Postprocess
     probs  = torch.softmax(logits, dim=1)
     seg    = torch.argmax(probs, dim=1)[0]
     seg_np = seg.cpu().numpy().astype("uint8")
-    seg_np[seg_np == 3] = 4
+    seg_np[seg_np == 3] = 4                 # restore BraTS label 4
 
+    # Save NIfTI — preserves original affine/header from T1
+    import nibabel as nib
     ref_nii = nib.load(t1_path)
     seg_nii = nib.Nifti1Image(seg_np, affine=ref_nii.affine,
                                header=ref_nii.header)
@@ -538,6 +574,7 @@ def run_inference(
     nib.save(seg_nii, output_path)
     logger.info(f"✓ Segmentation saved → {output_path}")
 
+    # Report
     report = generate_tumor_report(seg_np, VOXEL_SPACING_MM)
     print_tumor_report(report)
 
@@ -548,7 +585,7 @@ def run_inference(
     }
 
 # =====================================================
-# 1️⃣5️⃣  Checkpoint Helper
+# 1️⃣6️⃣  Checkpoint Helper
 # =====================================================
 
 def save_checkpoint(model, path: Path):
@@ -557,14 +594,15 @@ def save_checkpoint(model, path: Path):
     logger.info(f"  → Checkpoint saved : {path}")
 
 # =====================================================
-# 1️⃣6️⃣  Training
+# 1️⃣7️⃣  Training Loop
 # =====================================================
 
 def train():
     logger.info("=" * 60)
-    logger.info("MONAI 3D UNet — BraTS Segmentation  (VM Edition)")
+    logger.info("MONAI 3D UNet — BraTS Segmentation")
     logger.info("=" * 60)
 
+    # ── Setup ──────────────────────────────────────
     device = validate_gpu()
     data   = validate_dataset(DATA_DIR)
 
@@ -576,6 +614,7 @@ def train():
     val_files   = data[split_idx:]
     logger.info(f"Split → train : {len(train_files)}, val : {len(val_files)}")
 
+    # ── DataLoaders ────────────────────────────────
     train_ds = Dataset(train_files, transform=train_transforms)
     val_ds   = Dataset(val_files,   transform=val_transforms)
 
@@ -588,6 +627,7 @@ def train():
         num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available(),
     )
 
+    # ── Model ──────────────────────────────────────
     model = UNet(
         spatial_dims=3, in_channels=4, out_channels=4,
         channels=(16, 32, 64, 128, 256),
@@ -597,30 +637,22 @@ def train():
     loss_fn          = DiceCELoss(to_onehot_y=True, softmax=True,
                                   include_background=False)
     optimizer        = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+
+    # ── Metrics ────────────────────────────────────
     dice_metric_mean = DiceMetric(include_background=False, reduction="mean")
     dice_metric_none = DiceMetric(include_background=False, reduction="none")
-    post_pred        = Activations(softmax=True)
-    post_label       = AsDiscrete(to_onehot=4)
 
+    # ── State ──────────────────────────────────────
     best_dice         = 0.0
     epochs_no_improve = 0
     best_ckpt         = CHECKPOINT_DIR / "best_model.pth"
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── Unique run name prevents duplicate key on restart ──────
-    run_name = f"brats_unet_{int(time.time())}"
-
-    # ── Start MLflow run manually (NOT via context manager) ────
-    # Using context manager (with mlflow.start_run()) can cause
-    # nested runs and duplicate metric keys if the script is
-    # restarted. Manual start/end gives full control.
-    if mlflow:
-        run    = mlflow.start_run(run_name=run_name)
-        run_id = run.info.run_id
-        logger.info(f"MLflow run started : {run_name}  (id: {run_id})")
-    else:
-        run    = None
-        run_id = None
+    # ── MLflow run — manual start/end ──────────────
+    # NOT using context manager to prevent nested runs
+    # and duplicate metric keys on restart.
+    run    = mlflow.start_run(run_name=f"brats_unet_{int(time.time())}") if mlflow else None
+    run_id = run.info.run_id if run else None
 
     try:
         if mlflow and run:
@@ -639,6 +671,7 @@ def train():
                 "optimizer"    : "AdamW",
             })
 
+        # ══════════════════════════════════════════
         for epoch in range(MAX_EPOCHS):
 
             # ── Train ──────────────────────────────
@@ -661,41 +694,53 @@ def train():
             # ── Validation ─────────────────────────
             if (epoch + 1) % VAL_INTERVAL == 0:
                 model.eval()
+
                 with torch.no_grad():
                     for batch in val_loader:
                         images = batch["image"].to(device)
                         labels = batch["label"].to(device)
 
-                        outputs = model(images)
-                        outputs = post_pred(outputs)
-                        labels  = post_label(labels)
+                        # Sliding window for full-volume validation
+                        outputs = sliding_window_inference(
+                            inputs        = images,
+                            roi_size      = (128, 128, 128),
+                            sw_batch_size = 1,
+                            predictor     = model,
+                            overlap       = 0.5,
+                        )
 
-                        dice_metric_mean(outputs, labels)
-                        dice_metric_none(outputs, labels)
+                        # ── Correct postprocessing ──
+                        # decollate_batch splits (B,C,H,W,D) → list of (C,H,W,D)
+                        # post_pred  : softmax → argmax → one-hot (discrete)
+                        # post_label : one-hot only
+                        # DiceMetric needs per-sample discrete tensors — NOT batched
+                        outputs = [post_pred(i)  for i in decollate_batch(outputs)]
+                        labels  = [post_label(i) for i in decollate_batch(labels)]
+
+                        dice_metric_mean(y_pred=outputs, y=labels)
+                        dice_metric_none(y_pred=outputs, y=labels)
 
                 mean_dice      = dice_metric_mean.aggregate().item()
                 per_class_dice = dice_metric_none.aggregate()[0]
                 dice_metric_mean.reset()
                 dice_metric_none.reset()
 
-                # ── Safe log — NaN filtered out ────
+                # ── Log metrics ────────────────────
                 safe_log_metric("train_loss",    epoch_loss, step=epoch)
                 safe_log_metric("val_mean_dice", mean_dice,  step=epoch)
                 for i, val in enumerate(per_class_dice):
-                    safe_log_metric_tensor(
-                        f"val_dice_class_{i+1}", val, step=epoch
-                    )
+                    safe_log_metric_tensor(f"val_dice_class_{i+1}", val, step=epoch)
 
                 logger.info(
                     f"Epoch [{epoch+1}/{MAX_EPOCHS}]  "
                     f"Loss : {epoch_loss:.4f}  |  "
                     f"Val Dice : {mean_dice:.4f}  "
-                    f"[NCR:{per_class_dice[0]:.3f} "
-                    f"ED:{per_class_dice[1]:.3f} "
+                    f"[NCR:{per_class_dice[0]:.3f}  "
+                    f"ED:{per_class_dice[1]:.3f}  "
                     f"ET:{per_class_dice[2]:.3f}]"
                 )
 
-                # ── Save best ──────────────────────
+                # ── Early stopping / checkpoint ────
                 if mean_dice > best_dice + MIN_DELTA:
                     best_dice         = mean_dice
                     epochs_no_improve = 0
@@ -722,37 +767,33 @@ def train():
                     break
 
             else:
-                # No validation this epoch — log train loss only
+                # Epoch without validation
                 safe_log_metric("train_loss", epoch_loss, step=epoch)
                 logger.info(
                     f"Epoch [{epoch+1}/{MAX_EPOCHS}]  Loss : {epoch_loss:.4f}"
                 )
+        # ══════════════════════════════════════════
 
         # ── Register model ─────────────────────────
         if mlflow and run and MlflowClient is not None:
             model_uri  = f"runs:/{run_id}/{MODEL_NAME}"
-            registered = mlflow.register_model(
-                model_uri=model_uri, name="BraTS_UNet"
-            )
+            registered = mlflow.register_model(model_uri=model_uri,
+                                               name="BraTS_UNet")
             client = MlflowClient()
             client.transition_model_version_stage(
                 name="BraTS_UNet",
                 version=registered.version,
                 stage="Staging",
             )
-            logger.info(
-                f"✔ Model v{registered.version} registered → Staging"
-            )
+            logger.info(f"✔ Model v{registered.version} registered → Staging")
 
     except Exception as e:
-        # Mark run FAILED so it doesn't stay stuck as RUNNING
         if mlflow and run:
             mlflow.end_run(status="FAILED")
-            logger.error(f"Run marked FAILED in MLflow : {e}")
+            logger.error(f"Run marked FAILED : {e}")
         raise
 
     else:
-        # Clean finish — only reached if no exception
         if mlflow and run:
             mlflow.end_run(status="FINISHED")
             logger.info("MLflow run ended — FINISHED ✅")
@@ -763,24 +804,22 @@ def train():
     logger.info("=" * 60)
 
 # =====================================================
-# 1️⃣7️⃣  Entry Point
+# 1️⃣8️⃣  Entry Point
 # =====================================================
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="BraTS UNet — Train or Infer"
-    )
+    parser = argparse.ArgumentParser(description="BraTS UNet — Train or Infer")
     parser.add_argument(
         "--mode", choices=["train", "infer"], default="train",
-        help="'train' to train, 'infer' to predict on one patient"
+        help="'train' to train the model, 'infer' to predict on one patient",
     )
     parser.add_argument("--model_path", default="./checkpoints/best_model.pth")
-    parser.add_argument("--t1",    default=None)
-    parser.add_argument("--t1ce", default=None)
-    parser.add_argument("--t2",   default=None)
-    parser.add_argument("--flair",default=None)
+    parser.add_argument("--t1",    default=None, help="Path to T1 NIfTI file")
+    parser.add_argument("--t1ce", default=None, help="Path to T1ce NIfTI file")
+    parser.add_argument("--t2",   default=None, help="Path to T2 NIfTI file")
+    parser.add_argument("--flair",default=None, help="Path to FLAIR NIfTI file")
     parser.add_argument("--output", default="./prediction_seg.nii.gz")
 
     args = parser.parse_args()
