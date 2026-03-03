@@ -13,6 +13,7 @@
 import os
 import sys
 import glob
+import time
 import random
 import logging
 import numpy as np
@@ -39,9 +40,8 @@ from monai.transforms import (
     Activations,
     AsDiscrete,
     MapTransform,
+    DivisiblePadd,
 )
-from monai.transforms import DivisiblePadd
-
 from monai.inferers import sliding_window_inference
 
 # =====================================================
@@ -59,26 +59,26 @@ logger = logging.getLogger(__name__)
 # 4️⃣  Config — all overridable via env vars
 # =====================================================
 
-DATA_DIR        = Path(os.environ.get("DATA_ROOT",
-                        "/workspace/data/BraTS20"))
-CHECKPOINT_DIR  = Path(os.environ.get("CHECKPOINT_DIR", "./checkpoints"))
+DATA_DIR         = Path(os.environ.get("DATA_ROOT",
+                         "/workspace/data/BraTS20"))
+CHECKPOINT_DIR   = Path(os.environ.get("CHECKPOINT_DIR", "./checkpoints"))
 
-MAX_EPOCHS      = int(os.environ.get("MAX_EPOCHS",    "100"))
-BATCH_SIZE      = int(os.environ.get("BATCH_SIZE",    "2"))
-LEARNING_RATE   = float(os.environ.get("LEARNING_RATE","1e-4"))
-PATIENCE        = int(os.environ.get("PATIENCE",      "15"))
-MIN_DELTA       = float(os.environ.get("MIN_DELTA",   "0.001"))
-VAL_INTERVAL    = int(os.environ.get("VAL_INTERVAL",  "1"))
+MAX_EPOCHS       = int(os.environ.get("MAX_EPOCHS",    "100"))
+BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",    "2"))
+LEARNING_RATE    = float(os.environ.get("LEARNING_RATE","1e-4"))
+PATIENCE         = int(os.environ.get("PATIENCE",      "15"))
+MIN_DELTA        = float(os.environ.get("MIN_DELTA",   "0.001"))
+VAL_INTERVAL     = int(os.environ.get("VAL_INTERVAL",  "1"))
 
-_cpu_cap        = max(1, (os.cpu_count() or 2) - 1)
-NUM_WORKERS     = int(os.environ.get("NUM_WORKERS", str(min(4, _cpu_cap))))
-REQUIRE_GPU     = os.environ.get("REQUIRE_GPU", "true").lower() != "false"
+_cpu_cap         = max(1, (os.cpu_count() or 2) - 1)
+NUM_WORKERS      = int(os.environ.get("NUM_WORKERS", str(min(4, _cpu_cap))))
+REQUIRE_GPU      = os.environ.get("REQUIRE_GPU", "true").lower() != "false"
 
-MLFLOW_URI      = os.environ.get("MLFLOW_TRACKING_URI", "").strip()
-MODEL_NAME      = os.environ.get("MODEL_NAME", "brats_unet_v1")
+MLFLOW_URI       = os.environ.get("MLFLOW_TRACKING_URI", "").strip()
+MODEL_NAME       = os.environ.get("MODEL_NAME", "brats_unet_v1")
 
-# Voxel spacing used during training — needed for mm³ volume calculation
-VOXEL_SPACING_MM = (1.0, 1.0, 1.0)   # after Spacingd resampling
+# Voxel spacing after Spacingd resampling — used for volume calculation
+VOXEL_SPACING_MM = (1.0, 1.0, 1.0)
 
 # =====================================================
 # 5️⃣  MLflow — fully optional
@@ -107,7 +107,39 @@ else:
     logger.info("MLFLOW_TRACKING_URI not set — MLflow tracking disabled.")
 
 # =====================================================
-# 6️⃣  GPU Validation
+# 6️⃣  MLflow Safe Logging Helpers
+#      Filters NaN/Inf — prevents PostgreSQL duplicate
+#      key BAD_REQUEST crash
+# =====================================================
+
+def safe_log_metric(key: str, value: float, step: int):
+    """
+    Log only if value is a real finite number.
+    NaN and Inf are silently skipped — they cause
+    PostgreSQL unique constraint violations in MLflow.
+    """
+    if mlflow is None:
+        return
+    if value is None:
+        return
+    if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
+        logger.warning(
+            f"Skipping MLflow metric '{key}' step={step} — value={value}"
+        )
+        return
+    mlflow.log_metric(key, value, step=step)
+
+
+def safe_log_metric_tensor(key: str, tensor_val, step: int):
+    """Same as safe_log_metric but accepts torch tensors."""
+    try:
+        val = tensor_val.item() if hasattr(tensor_val, "item") else float(tensor_val)
+        safe_log_metric(key, val, step=step)
+    except Exception as e:
+        logger.warning(f"Could not log metric '{key}': {e}")
+
+# =====================================================
+# 7️⃣  GPU Validation
 # =====================================================
 
 def validate_gpu() -> torch.device:
@@ -127,16 +159,15 @@ def validate_gpu() -> torch.device:
     return torch.device("cuda" if has_gpu else "cpu")
 
 # =====================================================
-# 7️⃣  Safe Glob Helper
+# 8️⃣  Safe Glob Helper
 # =====================================================
 
 def safe_glob_one(pattern: str, description: str) -> str:
     """
     Glob and return first match.
-    Raises FileNotFoundError clearly instead of IndexError.
     Handles both .nii and .nii.gz automatically.
+    Raises FileNotFoundError clearly instead of IndexError.
     """
-    # Try the given pattern first, then fallback without .gz
     for pat in [pattern, pattern.replace(".nii.gz", ".nii")]:
         matches = sorted(glob.glob(pat))
         if matches:
@@ -149,7 +180,7 @@ def safe_glob_one(pattern: str, description: str) -> str:
     )
 
 # =====================================================
-# 8️⃣  Dataset Validation
+# 9️⃣  Dataset Validation
 # =====================================================
 
 def validate_dataset(data_dir: Path) -> list:
@@ -178,7 +209,7 @@ def validate_dataset(data_dir: Path) -> list:
         try:
             entry = {
                 "image": [
-                    # Order is FIXED — must match inference order
+                    # ORDER IS FIXED — must match inference order always
                     safe_glob_one(os.path.join(cp, "*_t1.nii.gz"),    f"{case_path.name} T1"),
                     safe_glob_one(os.path.join(cp, "*_t1ce.nii.gz"),  f"{case_path.name} T1ce"),
                     safe_glob_one(os.path.join(cp, "*_t2.nii.gz"),    f"{case_path.name} T2"),
@@ -202,14 +233,14 @@ def validate_dataset(data_dir: Path) -> list:
     return data
 
 # =====================================================
-# 9️⃣  BraTS Label Remap  (4 → 3 for training)
+# 🔟  BraTS Label Remap  (4 → 3 for training)
 # =====================================================
 
 class RemapBraTSLabels(MapTransform):
     """
-    BraTS uses labels: 0=background, 1=NCR, 2=ED, 4=ET
-    We remap 4→3 so labels are contiguous: 0,1,2,3
-    We reverse this (3→4) after inference.
+    BraTS labels: 0=background, 1=NCR, 2=ED, 4=ET
+    Remap 4→3 so labels are contiguous: 0,1,2,3
+    Reversed (3→4) after inference.
     """
     def __call__(self, data):
         d = dict(data)
@@ -219,7 +250,7 @@ class RemapBraTSLabels(MapTransform):
         return d
 
 # =====================================================
-# 🔟  Transforms
+# 1️⃣1️⃣  Transforms
 # =====================================================
 
 train_transforms = Compose([
@@ -229,12 +260,12 @@ train_transforms = Compose([
     Orientationd(keys=["image", "label"], axcodes="RAS"),
     Spacingd(keys=["image", "label"], pixdim=(1, 1, 1),
              mode=("bilinear", "nearest")),
-    DivisiblePadd(keys=["image", "label"], k=16),
+    DivisiblePadd(keys=["image", "label"], k=16),   # ensures dims % 2^4 == 0
     NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
     RandCropByPosNegLabeld(
         keys=["image", "label"],
         label_key="label",
-        spatial_size=(128, 128, 128),
+        spatial_size=(128, 128, 128),               # multiple of 16 ✅
         pos=1, neg=1, num_samples=4,
     ),
 ])
@@ -250,37 +281,28 @@ val_transforms = Compose([
     NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
 ])
 
-# Inference-only transforms (no label, no augmentation)
+# Inference-only — no label key
 infer_transforms = Compose([
     LoadImaged(keys=["image"]),
     EnsureChannelFirstd(keys=["image"]),
     Orientationd(keys=["image"], axcodes="RAS"),
     Spacingd(keys=["image"], pixdim=(1, 1, 1), mode="bilinear"),
-    DivisiblePadd(keys=["image", "label"], k=16),
+    DivisiblePadd(keys=["image"], k=16),            # image only — no "label" key
     NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
 ])
 
 # =====================================================
-# 1️⃣1️⃣  Tumor Report Generator
+# 1️⃣2️⃣  Tumor Report Generator
 # =====================================================
 
-# BraTS label definitions (after remapping 3→4 restored)
 TUMOR_LABELS = {
     1: "NCR — Necrotic Core",
     2: "ED  — Peritumoral Edema",
     4: "ET  — Enhancing Tumor",
 }
 
-# WHO grade heuristic based on region presence
-# Real grading requires histopathology — this is a decision-support hint only
+
 def classify_tumor_grade(has_et: bool, has_ncr: bool, has_ed: bool) -> str:
-    """
-    Simplified WHO-based heuristic:
-    - ET present           → likely High-Grade (WHO III–IV, Glioblastoma)
-    - NCR + ED, no ET      → possibly High-Grade (WHO III)
-    - ED only, no ET/NCR   → possibly Low-Grade (WHO II)
-    - None present         → No tumor detected
-    """
     if has_et:
         return "High-Grade Glioma (WHO Grade III–IV) — Enhancing tumor present ⚠️"
     elif has_ncr and has_ed:
@@ -290,41 +312,34 @@ def classify_tumor_grade(has_et: bool, has_ncr: bool, has_ed: bool) -> str:
     else:
         return "No significant tumor regions detected"
 
+
 def generate_tumor_report(seg: np.ndarray,
                            voxel_spacing_mm: tuple = (1.0, 1.0, 1.0)) -> dict:
-    """
-    Given a segmentation mask (H, W, D) with BraTS labels (0,1,2,4),
-    compute per-region volume in mm³ and cm³, total tumor volume,
-    and a WHO grade heuristic.
-
-    Returns a dict suitable for logging or displaying to a physician.
-    """
-    voxel_vol_mm3 = voxel_spacing_mm[0] * voxel_spacing_mm[1] * voxel_spacing_mm[2]
-
-    report = {}
+    voxel_vol_mm3  = (voxel_spacing_mm[0]
+                      * voxel_spacing_mm[1]
+                      * voxel_spacing_mm[2])
+    report         = {}
     region_volumes = {}
 
     for label_id, label_name in TUMOR_LABELS.items():
-        voxel_count = int(np.sum(seg == label_id))
-        vol_mm3     = voxel_count * voxel_vol_mm3
-        vol_cm3     = vol_mm3 / 1000.0
+        voxel_count              = int(np.sum(seg == label_id))
+        vol_mm3                  = voxel_count * voxel_vol_mm3
+        vol_cm3                  = vol_mm3 / 1000.0
         region_volumes[label_id] = vol_mm3
-        report[label_name] = {
+        report[label_name]       = {
             "voxel_count": voxel_count,
-            "volume_mm3":  round(vol_mm3,  2),
-            "volume_cm3":  round(vol_cm3,  4),
+            "volume_mm3":  round(vol_mm3, 2),
+            "volume_cm3":  round(vol_cm3, 4),
         }
 
-    # Whole Tumor = NCR + ED + ET  (labels 1, 2, 4)
-    wt_voxels   = int(np.sum(seg > 0))
-    wt_vol_mm3  = wt_voxels * voxel_vol_mm3
+    wt_voxels  = int(np.sum(seg > 0))
+    wt_vol_mm3 = wt_voxels * voxel_vol_mm3
     report["Whole Tumor"] = {
         "voxel_count": wt_voxels,
         "volume_mm3":  round(wt_vol_mm3, 2),
         "volume_cm3":  round(wt_vol_mm3 / 1000.0, 4),
     }
 
-    # Tumor Core = NCR + ET  (labels 1, 4)
     tc_voxels  = int(np.sum((seg == 1) | (seg == 4)))
     tc_vol_mm3 = tc_voxels * voxel_vol_mm3
     report["Tumor Core"] = {
@@ -333,19 +348,17 @@ def generate_tumor_report(seg: np.ndarray,
         "volume_cm3":  round(tc_vol_mm3 / 1000.0, 4),
     }
 
-    # Grade heuristic
     report["WHO Grade Heuristic"] = classify_tumor_grade(
         has_et  = region_volumes.get(4, 0) > 0,
         has_ncr = region_volumes.get(1, 0) > 0,
         has_ed  = region_volumes.get(2, 0) > 0,
     )
-
     report["⚠️ Clinical Disclaimer"] = (
-        "This is a decision-support tool only. "
+        "Decision-support tool only. "
         "All findings must be confirmed by a qualified radiologist/oncologist."
     )
-
     return report
+
 
 def print_tumor_report(report: dict):
     logger.info("=" * 55)
@@ -354,30 +367,33 @@ def print_tumor_report(report: dict):
     for key, val in report.items():
         if isinstance(val, dict):
             logger.info(f"  {key}:")
-            logger.info(f"    Voxels   : {val['voxel_count']:,}")
-            logger.info(f"    Volume   : {val['volume_mm3']:,.1f} mm³  "
-                        f"({val['volume_cm3']:.2f} cm³)")
+            logger.info(f"    Voxels : {val['voxel_count']:,}")
+            logger.info(f"    Volume : {val['volume_mm3']:,.1f} mm³"
+                        f"  ({val['volume_cm3']:.2f} cm³)")
         else:
             logger.info(f"  {key}: {val}")
     logger.info("=" * 55)
 
 # =====================================================
-# 1️⃣2️⃣  PyFunc Production Model (saved to MLflow)
+# 1️⃣3️⃣  PyFunc Production Model (logged to MLflow)
 # =====================================================
 
 if mlflow_pyfunc is not None:
 
     class BraTS_UNet_v1_PyFunc(mlflow_pyfunc.PythonModel):
         """
-        Production MLflow PyFunc model.
+        MLflow PyFunc wrapper for production inference.
 
-        Input  : {"image": [t1_path, t1ce_path, t2_path, flair_path]}
-                 All paths must be .nii or .nii.gz files on the same machine.
-                 ORDER IS FIXED: t1 → t1ce → t2 → flair
+        Input:
+            {"image": [t1_path, t1ce_path, t2_path, flair_path]}
+            ORDER IS FIXED: t1 → t1ce → t2 → flair
+            Accepts .nii and .nii.gz
 
-        Output : dict with keys:
-                   "segmentation" → np.ndarray (H, W, D) uint8, BraTS labels
-                   "report"       → dict with volumes + grade heuristic
+        Output:
+            {
+              "segmentation": np.ndarray (H, W, D) uint8 — BraTS labels 0,1,2,4
+              "report":       dict — volumes + WHO grade heuristic
+            }
         """
 
         def load_context(self, context):
@@ -407,187 +423,122 @@ if mlflow_pyfunc is not None:
                 EnsureChannelFirstd(keys=["image"]),
                 Orientationd(keys=["image"], axcodes="RAS"),
                 Spacingd(keys=["image"], pixdim=(1, 1, 1), mode="bilinear"),
+                DivisiblePadd(keys=["image"], k=16),
                 NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
             ])
 
         def predict(self, context, model_input: dict) -> dict:
-            """
-            Parameters
-            ----------
-            model_input : dict
-                {
-                  "image": [
-                      "/path/BraTS20_001_t1.nii",      # channel 0
-                      "/path/BraTS20_001_t1ce.nii",    # channel 1
-                      "/path/BraTS20_001_t2.nii",      # channel 2
-                      "/path/BraTS20_001_flair.nii",   # channel 3
-                  ]
-                }
-
-            Returns
-            -------
-            dict
-                {
-                  "segmentation": np.ndarray (H, W, D) uint8,
-                  "report":       dict  ← volumes + WHO grade heuristic
-                }
-            """
-            # ── 1. Validate input ──────────────────
+            # ── 1. Validate ────────────────────────
             if "image" not in model_input:
                 raise ValueError(
-                    "model_input must contain key 'image' with a list of 4 NIfTI paths.\n"
+                    "model_input must contain key 'image' "
+                    "with a list of 4 NIfTI paths.\n"
                     "  Order: [t1, t1ce, t2, flair]"
                 )
-
             paths = model_input["image"]
-
             if len(paths) != 4:
                 raise ValueError(
-                    f"Expected exactly 4 NIfTI files [t1, t1ce, t2, flair], "
+                    f"Expected 4 NIfTI files [t1, t1ce, t2, flair], "
                     f"got {len(paths)}."
                 )
-
             for i, p in enumerate(paths):
-                modality = ["t1", "t1ce", "t2", "flair"][i]
+                mod = ["t1", "t1ce", "t2", "flair"][i]
                 if not os.path.exists(p):
                     raise FileNotFoundError(
-                        f"NIfTI file not found for {modality} (channel {i}): {p}"
+                        f"NIfTI not found for {mod} (channel {i}): {p}"
                     )
 
             # ── 2. Preprocess ──────────────────────
             logger.info("Running inference...")
             data  = self.preprocess({"image": paths})
             image = data["image"].unsqueeze(0).to(self.device)
-            # shape → (1, 4, H, W, D)
 
-            # ── 3. Sliding window inference ────────
+            # ── 3. Sliding window ──────────────────
             with torch.no_grad():
                 logits = sliding_window_inference(
-                    inputs      = image,
-                    roi_size    = (96, 96, 96),
+                    inputs        = image,
+                    roi_size      = (128, 128, 128),
                     sw_batch_size = 1,
-                    predictor   = self.model,
-                    overlap     = 0.5,        # 0.5 = better quality than 0.25
+                    predictor     = self.model,
+                    overlap       = 0.5,
                 )
-            # logits shape → (1, 4, H, W, D)
 
-            # ── 4. Postprocess → class map ─────────
-            probs  = torch.softmax(logits, dim=1)       # (1, 4, H, W, D)
-            seg    = torch.argmax(probs, dim=1)[0]      # (H, W, D)
+            # ── 4. Postprocess ─────────────────────
+            probs  = torch.softmax(logits, dim=1)
+            seg    = torch.argmax(probs, dim=1)[0]
             seg_np = seg.cpu().numpy().astype("uint8")
+            seg_np[seg_np == 3] = 4             # restore BraTS label 4
 
-            # ── 5. Restore original BraTS labels ───
-            # Training remapped 4→3; restore 3→4
-            seg_np[seg_np == 3] = 4
-
-            # ── 6. Generate tumor report ───────────
-            report = generate_tumor_report(seg_np, voxel_spacing_mm=VOXEL_SPACING_MM)
+            # ── 5. Report ──────────────────────────
+            report = generate_tumor_report(seg_np, VOXEL_SPACING_MM)
             print_tumor_report(report)
 
-            return {
-                "segmentation": seg_np,   # (H, W, D) uint8, labels: 0,1,2,4
-                "report":       report,
-            }
+            return {"segmentation": seg_np, "report": report}
 
 # =====================================================
-# 1️⃣3️⃣  Standalone Inference Function
-#         (use this when MLflow is NOT available)
+# 1️⃣4️⃣  Standalone Inference (no MLflow needed)
 # =====================================================
 
 def run_inference(
-    model_path: str,
-    t1_path:    str,
-    t1ce_path:  str,
-    t2_path:    str,
-    flair_path: str,
+    model_path:  str,
+    t1_path:     str,
+    t1ce_path:   str,
+    t2_path:     str,
+    flair_path:  str,
     output_path: str = "./prediction_seg.nii.gz",
 ) -> dict:
     """
-    Standalone inference — no MLflow needed.
-    Loads best_model.pth, runs prediction, saves NIfTI + returns report.
-
-    Usage:
-        result = run_inference(
-            model_path  = "./checkpoints/best_model.pth",
-            t1_path     = "/data/case001/BraTS20_001_t1.nii",
-            t1ce_path   = "/data/case001/BraTS20_001_t1ce.nii",
-            t2_path     = "/data/case001/BraTS20_001_t2.nii",
-            flair_path  = "/data/case001/BraTS20_001_flair.nii",
-            output_path = "./case001_seg.nii.gz",
-        )
-        print(result["report"])
+    Standalone inference — loads best_model.pth directly.
+    Saves segmentation as NIfTI and returns tumor report.
     """
     try:
         import nibabel as nib
     except ImportError:
-        raise ImportError(
-            "nibabel is required to save NIfTI output.\n"
-            "  Install: pip install nibabel"
-        )
+        raise ImportError("pip install nibabel")
 
     device = validate_gpu()
 
-    # ── Validate inputs ────────────────────────────
-    paths = {
-        "t1":    t1_path,
-        "t1ce":  t1ce_path,
-        "t2":    t2_path,
-        "flair": flair_path,
-    }
-    for mod, p in paths.items():
+    for mod, p in {"t1": t1_path, "t1ce": t1ce_path,
+                   "t2": t2_path, "flair": flair_path}.items():
         if not os.path.exists(p):
             raise FileNotFoundError(f"Missing {mod} file: {p}")
 
     if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
+        raise FileNotFoundError(f"Checkpoint not found: {model_path}")
 
-    # ── Load model ─────────────────────────────────
     model = UNet(
-        spatial_dims=3,
-        in_channels=4,
-        out_channels=4,
+        spatial_dims=3, in_channels=4, out_channels=4,
         channels=(16, 32, 64, 128, 256),
-        strides=(2, 2, 2, 2),
-        num_res_units=2,
+        strides=(2, 2, 2, 2), num_res_units=2,
     ).to(device)
-
-    model.load_state_dict(
-        torch.load(model_path, map_location=device)
-    )
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     logger.info(f"✓ Model loaded from {model_path}")
 
-    # ── Preprocess ─────────────────────────────────
     image_paths = [t1_path, t1ce_path, t2_path, flair_path]
-    data  = infer_transforms({"image": image_paths})
-    image = data["image"].unsqueeze(0).to(device)
+    data        = infer_transforms({"image": image_paths})
+    image       = data["image"].unsqueeze(0).to(device)
 
-    # ── Inference ──────────────────────────────────
     logger.info("Running sliding window inference...")
     with torch.no_grad():
         logits = sliding_window_inference(
-            inputs        = image,
-            roi_size      = (128, 128, 128),
-            sw_batch_size = 1,
-            predictor     = model,
-            overlap       = 0.5,
+            inputs=image, roi_size=(128, 128, 128),
+            sw_batch_size=1, predictor=model, overlap=0.5,
         )
 
     probs  = torch.softmax(logits, dim=1)
     seg    = torch.argmax(probs, dim=1)[0]
     seg_np = seg.cpu().numpy().astype("uint8")
-    seg_np[seg_np == 3] = 4          # restore BraTS label 4
+    seg_np[seg_np == 3] = 4
 
-    # ── Save NIfTI ─────────────────────────────────
-    ref_nii  = nib.load(t1_path)
-    seg_nii  = nib.Nifti1Image(seg_np, affine=ref_nii.affine,
-                                header=ref_nii.header)
+    ref_nii = nib.load(t1_path)
+    seg_nii = nib.Nifti1Image(seg_np, affine=ref_nii.affine,
+                               header=ref_nii.header)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     nib.save(seg_nii, output_path)
     logger.info(f"✓ Segmentation saved → {output_path}")
 
-    # ── Tumor report ───────────────────────────────
-    report = generate_tumor_report(seg_np, voxel_spacing_mm=VOXEL_SPACING_MM)
+    report = generate_tumor_report(seg_np, VOXEL_SPACING_MM)
     print_tumor_report(report)
 
     return {
@@ -597,7 +548,7 @@ def run_inference(
     }
 
 # =====================================================
-# 1️⃣4️⃣  Checkpoint Helper
+# 1️⃣5️⃣  Checkpoint Helper
 # =====================================================
 
 def save_checkpoint(model, path: Path):
@@ -606,7 +557,7 @@ def save_checkpoint(model, path: Path):
     logger.info(f"  → Checkpoint saved : {path}")
 
 # =====================================================
-# 1️⃣5️⃣  Training
+# 1️⃣6️⃣  Training
 # =====================================================
 
 def train():
@@ -638,12 +589,9 @@ def train():
     )
 
     model = UNet(
-        spatial_dims=3,
-        in_channels=4,
-        out_channels=4,
+        spatial_dims=3, in_channels=4, out_channels=4,
         channels=(16, 32, 64, 128, 256),
-        strides=(2, 2, 2, 2),
-        num_res_units=2,
+        strides=(2, 2, 2, 2), num_res_units=2,
     ).to(device)
 
     loss_fn          = DiceCELoss(to_onehot_y=True, softmax=True,
@@ -659,10 +607,23 @@ def train():
     best_ckpt         = CHECKPOINT_DIR / "best_model.pth"
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
-    run_ctx = mlflow.start_run() if mlflow else None
+    # ── Unique run name prevents duplicate key on restart ──────
+    run_name = f"brats_unet_{int(time.time())}"
+
+    # ── Start MLflow run manually (NOT via context manager) ────
+    # Using context manager (with mlflow.start_run()) can cause
+    # nested runs and duplicate metric keys if the script is
+    # restarted. Manual start/end gives full control.
+    if mlflow:
+        run    = mlflow.start_run(run_name=run_name)
+        run_id = run.info.run_id
+        logger.info(f"MLflow run started : {run_name}  (id: {run_id})")
+    else:
+        run    = None
+        run_id = None
 
     try:
-        if mlflow and run_ctx:
+        if mlflow and run:
             mlflow.log_params({
                 "architecture" : "UNet_3D",
                 "dataset"      : "BraTS2020",
@@ -717,17 +678,18 @@ def train():
                 dice_metric_mean.reset()
                 dice_metric_none.reset()
 
-                if mlflow and run_ctx:
-                    mlflow.log_metric("train_loss",    epoch_loss, step=epoch)
-                    mlflow.log_metric("val_mean_dice", mean_dice,  step=epoch)
-                    for i, val in enumerate(per_class_dice):
-                        mlflow.log_metric(
-                            f"val_dice_class_{i+1}", val.item(), step=epoch
-                        )
+                # ── Safe log — NaN filtered out ────
+                safe_log_metric("train_loss",    epoch_loss, step=epoch)
+                safe_log_metric("val_mean_dice", mean_dice,  step=epoch)
+                for i, val in enumerate(per_class_dice):
+                    safe_log_metric_tensor(
+                        f"val_dice_class_{i+1}", val, step=epoch
+                    )
 
                 logger.info(
                     f"Epoch [{epoch+1}/{MAX_EPOCHS}]  "
-                    f"Loss : {epoch_loss:.4f}  |  Val Dice : {mean_dice:.4f}  "
+                    f"Loss : {epoch_loss:.4f}  |  "
+                    f"Val Dice : {mean_dice:.4f}  "
                     f"[NCR:{per_class_dice[0]:.3f} "
                     f"ED:{per_class_dice[1]:.3f} "
                     f"ET:{per_class_dice[2]:.3f}]"
@@ -739,8 +701,7 @@ def train():
                     epochs_no_improve = 0
                     save_checkpoint(model, best_ckpt)
 
-                    # Log PyFunc to MLflow
-                    if mlflow and run_ctx and mlflow_pyfunc is not None:
+                    if mlflow and run and mlflow_pyfunc is not None:
                         mlflow_pyfunc.log_model(
                             artifact_path = MODEL_NAME,
                             python_model  = BraTS_UNet_v1_PyFunc(),
@@ -753,8 +714,7 @@ def train():
                 else:
                     epochs_no_improve += 1
                     logger.info(
-                        f"  No improvement "
-                        f"({epochs_no_improve}/{PATIENCE})"
+                        f"  No improvement ({epochs_no_improve}/{PATIENCE})"
                     )
 
                 if epochs_no_improve >= PATIENCE:
@@ -762,16 +722,15 @@ def train():
                     break
 
             else:
+                # No validation this epoch — log train loss only
+                safe_log_metric("train_loss", epoch_loss, step=epoch)
                 logger.info(
                     f"Epoch [{epoch+1}/{MAX_EPOCHS}]  Loss : {epoch_loss:.4f}"
                 )
-                if mlflow and run_ctx:
-                    mlflow.log_metric("train_loss", epoch_loss, step=epoch)
 
         # ── Register model ─────────────────────────
-        if mlflow and run_ctx and MlflowClient is not None:
-            run_id    = run_ctx.info.run_id
-            model_uri = f"runs:/{run_id}/{MODEL_NAME}"
+        if mlflow and run and MlflowClient is not None:
+            model_uri  = f"runs:/{run_id}/{MODEL_NAME}"
             registered = mlflow.register_model(
                 model_uri=model_uri, name="BraTS_UNet"
             )
@@ -785,9 +744,18 @@ def train():
                 f"✔ Model v{registered.version} registered → Staging"
             )
 
-    finally:
-        if mlflow and run_ctx:
-            mlflow.end_run()
+    except Exception as e:
+        # Mark run FAILED so it doesn't stay stuck as RUNNING
+        if mlflow and run:
+            mlflow.end_run(status="FAILED")
+            logger.error(f"Run marked FAILED in MLflow : {e}")
+        raise
+
+    else:
+        # Clean finish — only reached if no exception
+        if mlflow and run:
+            mlflow.end_run(status="FINISHED")
+            logger.info("MLflow run ended — FINISHED ✅")
 
     logger.info("=" * 60)
     logger.info(f"Training complete.  Best Val Dice : {best_dice:.4f}")
@@ -795,7 +763,7 @@ def train():
     logger.info("=" * 60)
 
 # =====================================================
-# 1️⃣6️⃣  Entry Point
+# 1️⃣7️⃣  Entry Point
 # =====================================================
 
 if __name__ == "__main__":
@@ -806,9 +774,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--mode", choices=["train", "infer"], default="train",
-        help="'train' to train the model, 'infer' to run prediction on one patient"
+        help="'train' to train, 'infer' to predict on one patient"
     )
-    # Inference-only args
     parser.add_argument("--model_path", default="./checkpoints/best_model.pth")
     parser.add_argument("--t1",    default=None)
     parser.add_argument("--t1ce", default=None)
@@ -822,17 +789,19 @@ if __name__ == "__main__":
         train()
 
     elif args.mode == "infer":
-        for flag, val in [("--t1", args.t1), ("--t1ce", args.t1ce),
-                          ("--t2", args.t2), ("--flair", args.flair)]:
+        for flag, val in [("--t1",   args.t1),
+                          ("--t1ce", args.t1ce),
+                          ("--t2",   args.t2),
+                          ("--flair",args.flair)]:
             if val is None:
                 raise ValueError(
                     f"{flag} is required for inference mode.\n"
                     f"  Example:\n"
                     f"    python train_brats_unet_final.py --mode infer \\\n"
                     f"      --model_path ./checkpoints/best_model.pth \\\n"
-                    f"      --t1   /data/case001/BraTS20_001_t1.nii \\\n"
-                    f"      --t1ce /data/case001/BraTS20_001_t1ce.nii \\\n"
-                    f"      --t2   /data/case001/BraTS20_001_t2.nii \\\n"
+                    f"      --t1    /data/case001/BraTS20_001_t1.nii \\\n"
+                    f"      --t1ce  /data/case001/BraTS20_001_t1ce.nii \\\n"
+                    f"      --t2    /data/case001/BraTS20_001_t2.nii \\\n"
                     f"      --flair /data/case001/BraTS20_001_flair.nii \\\n"
                     f"      --output ./case001_seg.nii.gz"
                 )
