@@ -1,0 +1,12 @@
+.venv
+__pycache__
+*.pt
+*.pth
+*.ckpt
+*.nii
+*.nii.gz
+data/
+outputs/
+logs/
+.git
+.ruff_cache
