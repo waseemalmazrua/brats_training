@@ -34,3 +34,15 @@ result = model.predict({
 
 print(result["report"])
 seg = result["segmentation"]
+
+
+# ── Save JSON report ───────────────────────────
+output_dir = Path("outputs")
+output_dir.mkdir(exist_ok=True)
+
+json_path = output_dir / f"{args.case_id}_report.json"
+
+with open(json_path, "w") as f:
+    json.dump(result["report"], f, indent=4)
+
+print("JSON report saved to:", json_path)
