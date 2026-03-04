@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "dotenv>=0.9.9",
     "google-cloud-storage>=3.9.0",
     "mlflow>=3.10.0",
     "monai>=1.5.2",
