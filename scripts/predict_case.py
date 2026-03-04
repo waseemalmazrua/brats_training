@@ -13,7 +13,7 @@ args = parser.parse_args()
 
 # ── Model config from .env ─────────────────────
 model_name  = os.getenv("REGISTERED_MODEL_NAME", "BraTS_UNet")
-model_stage = os.getenv("MODEL_STAGE",           "Production")
+model_stage = os.getenv("MODEL_STAGE",           "production")
 
 # ── Load model ─────────────────────────────────
 model = mlflow.pyfunc.load_model(f"models:/{model_name}/{model_stage}")
